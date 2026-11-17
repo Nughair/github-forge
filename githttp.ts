@@ -24,11 +24,47 @@ import {
   type GitObject,
   type PktPacket,
 } from './gitobj.ts';
-import type { Repo, Store } from './store.ts';
+import { captureResponse, serveResponse, type CachedResponse } from './cache.ts';
+import { Store, type Repo } from './store.ts';
 import { readBody, sendBytes, sendError } from './web.ts';
 
 const AGENT = 'lucky-comet-forge/1.0';
 const SIDEBAND_CHUNK = 16384;
+
+// ---------------------------------------------------------------------------------------------
+// wire response cache (the clone workload's lever)
+//
+// A clone is three exchanges — advertisement, ls-refs, fetch — and a burst of
+// clones of one repository all ask byte-identical questions. The ls-refs and
+// fetch answers are pure functions of the repository's reachable state, so
+// they are memoized under a fingerprint of that state: every ref's target plus
+// the object store's size. Objects are content-addressed and never leave the
+// store, and any object that becomes reachable does so through a ref, so two
+// moments with the same fingerprint have the same refs over the same objects
+// and the memoized bytes are exactly what a fresh computation would send.
+// Any push, contents write or merge moves a ref or grows the store, changing
+// the fingerprint and retiring every stale entry at once.
+
+const wireEntries = new Map<string, CachedResponse>();
+const WIRE_MAX_ENTRIES = 512;
+
+function wireStateKey(store: Store, repo: Repo): string {
+  let refs = '';
+  for (const [ref, oid] of repo.refs) refs += `${ref}=${oid};`;
+  return `${Store.key(repo.owner, repo.name)}|${store.objects.size}|${refs}`;
+}
+
+function wireLookup(key: string): CachedResponse | null {
+  return wireEntries.get(key) ?? null;
+}
+
+function wireStore(key: string, entry: CachedResponse): void {
+  if (!wireEntries.has(key) && wireEntries.size >= WIRE_MAX_ENTRIES) {
+    const oldest = wireEntries.keys().next().value;
+    if (oldest !== undefined) wireEntries.delete(oldest);
+  }
+  wireEntries.set(key, entry);
+}
 
 // ---------------------------------------------------------------------------------------------
 // pkt-line stream helpers
@@ -121,16 +157,18 @@ function v0RefBlock(store: Store, repo: Repo, capabilities: string): Buffer {
   return Buffer.concat(parts);
 }
 
+/** The v2 capability advertisement names no repository state: build it once, serve it forever. */
+const ADVERTISEMENT_V2 = Buffer.concat([
+  encodePktLine('version 2\n'),
+  encodePktLine(`agent=${AGENT}\n`),
+  encodePktLine('ls-refs=unborn\n'),
+  encodePktLine('fetch=shallow\n'),
+  encodePktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 function advertisementV2(store: Store, res: ServerResponse): void {
-  const body = Buffer.concat([
-    encodePktLine('version 2\n'),
-    encodePktLine(`agent=${AGENT}\n`),
-    encodePktLine('ls-refs=unborn\n'),
-    encodePktLine('fetch=shallow\n'),
-    encodePktLine('object-format=sha1\n'),
-    PKT_FLUSH,
-  ]);
-  sendBytes(store, res, 200, body, 'application/x-git-upload-pack-advertisement');
+  sendBytes(store, res, 200, ADVERTISEMENT_V2, 'application/x-git-upload-pack-advertisement');
 }
 
 export async function handleInfoRefs(
@@ -439,6 +477,24 @@ function handleFetchV0(store: Store, res: ServerResponse, repo: Repo, packets: P
 
 export async function handleUploadPack(store: Store, req: IncomingMessage, res: ServerResponse, repo: Repo): Promise<void> {
   const body = await readBody(req);
+  // ls-refs and fetch answers are memoized under the repo-state fingerprint
+  // plus the exact request bytes (see the wire cache note above): a burst of
+  // clones computes its pack once and replays it for the rest.
+  const protocol = req.headers['git-protocol'];
+  const isV2 = typeof protocol === 'string' && protocol.includes('version=2');
+  const key = `${wireStateKey(store, repo)}\n${isV2 ? 'v2' : 'v0'}\n${body.toString('latin1')}`;
+  const hit = wireLookup(key);
+  if (hit !== null) {
+    serveResponse(store, res, hit);
+    return;
+  }
+  const take = captureResponse(res);
+  await dispatchUploadPack(store, res, repo, body, isV2);
+  const entry = take();
+  if (entry !== null && entry.status === 200) wireStore(key, entry);
+}
+
+async function dispatchUploadPack(store: Store, res: ServerResponse, repo: Repo, body: Buffer, isV2: boolean): Promise<void> {
   let decoded: { packets: PktPacket[]; rest: Buffer };
   try {
     decoded = decodePktPrefix(body);
@@ -446,8 +502,6 @@ export async function handleUploadPack(store: Store, req: IncomingMessage, res: 
     sendError(store, res, 400, 'Malformed pkt-line stream');
     return;
   }
-  const protocol = req.headers['git-protocol'];
-  const isV2 = typeof protocol === 'string' && protocol.includes('version=2');
   if (!isV2) {
     // A v0 fetch body is framed in two sections; decode the whole body for its lines.
     try {
