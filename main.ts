@@ -6,8 +6,12 @@
 // Authorization: Bearer $MAKEFUN_SHOP_TOKEN (401 without it), then routes:
 // /api/v3/* to REST, /api/graphql to GraphQL, /mcp to MCP, and
 // /{owner}/{repo}.git/* to git smart HTTP. One Store instance backs them all.
+// The transport is the hand-rolled HTTP/1.1 server in rawhttp.ts: its
+// request/response shims carry exactly the Node surface the handlers use,
+// so the routing below is unchanged from the node:http era.
 
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { asIncomingMessage, asServerResponse, createRawServer } from './rawhttp.ts';
 import { captureResponse, lookupResponse, responseKey, serveResponse, storeResponse } from './cache.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleInfoRefs, handleReceivePack, handleUploadPack } from './githttp.ts';
@@ -143,8 +147,10 @@ async function dispatch(req: IncomingMessage, res: ServerResponse): Promise<void
   sendError(store, res, 404, 'Not Found');
 }
 
-const server = createServer((req, res) => {
-  route(req, res).catch(() => {
+const server = createRawServer((rawReq, rawRes) => {
+  const req = asIncomingMessage(rawReq);
+  const res = asServerResponse(rawRes);
+  return route(req, res).catch(() => {
     // A handler failure must never take the server down (the suite probes this).
     try {
       if (!res.headersSent) sendError(store, res, 500, 'Internal error');
