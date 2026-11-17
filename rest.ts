@@ -17,7 +17,7 @@ import {
   type Repo,
   type Store,
 } from './store.ts';
-import { isRecord, readJsonBody, sendEmpty, sendError, sendJson, stringField } from './web.ts';
+import { isRecord, readJsonBody, sendEmpty, sendError, sendJson, sendText, stringField } from './web.ts';
 
 const NOT_FOUND = 'Not Found';
 
@@ -59,6 +59,33 @@ export function issueJson(store: Store, repo: Repo, issue: IssueRec): Record<str
     created_at: store.isoOf(issue.createdSeq),
     updated_at: store.isoOf(issue.createdSeq),
   };
+}
+
+/** A JSON string literal for `value`: the common no-escape case inline, JSON.stringify otherwise. */
+function jsonString(value: string): string {
+  if (!/["\\\u0000-\u001f]/.test(value)) return `"${value}"`;
+  return JSON.stringify(value);
+}
+
+/**
+ * The issue document as bytes, built by template: field for field the same
+ * document issueJson + JSON.stringify produce (same key order, same values),
+ * without allocating the object graph. The issue create/read paths are the
+ * timed REST workloads, so they answer through this and sendText.
+ */
+export function issueText(store: Store, repo: Repo, issue: IssueRec): string {
+  const at = store.isoOf(issue.createdSeq);
+  let labels = '';
+  for (const name of issue.labels) {
+    const color = repo.labels.get(name)?.color ?? '000000';
+    if (labels !== '') labels += ',';
+    labels += `{"name":${jsonString(name)},"color":${jsonString(color)},"default":false}`;
+  }
+  return (
+    `{"id":${issue.dbId},"number":${issue.number},"title":${jsonString(issue.title)},"body":${jsonString(issue.body)},` +
+    `"state":"${issue.state}","labels":[${labels}],"user":{"login":"${VIEWER.login}","id":${VIEWER.id},"type":"User"},` +
+    `"comments":${issue.comments.length},"created_at":"${at}","updated_at":"${at}"}`
+  );
 }
 
 export function pullJson(store: Store, repo: Repo, pull: PullRec): Record<string, unknown> {
@@ -645,7 +672,7 @@ async function handleIssues(
         }
       }
       const issue = store.createIssue(repo, { title, body: stringField(body, 'body') ?? '', labels });
-      sendJson(store, res, 201, issueJson(store, repo, issue));
+      sendText(store, res, 201, issueText(store, repo, issue));
       return true;
     }
     if (method === 'GET') {
@@ -657,7 +684,7 @@ async function handleIssues(
       if (direction !== 'asc') issues.reverse();
       const page = pageOf(query);
       const paged = query.has('per_page') ? slicePage(issues, page) : issues;
-      sendJson(store, res, 200, paged.map((issue) => issueJson(store, repo, issue)));
+      sendText(store, res, 200, `[${paged.map((issue) => issueText(store, repo, issue)).join(',')}]`);
       return true;
     }
     return notFound(store, res);
@@ -670,7 +697,7 @@ async function handleIssues(
   if (segments.length === 1) {
     if (issue === undefined) return notFound(store, res);
     if (method === 'GET') {
-      sendJson(store, res, 200, issueJson(store, repo, issue));
+      sendText(store, res, 200, issueText(store, repo, issue));
       return true;
     }
     if (method === 'PATCH') {
@@ -700,7 +727,7 @@ async function handleIssues(
           issue.labels = labels;
         }
       }
-      sendJson(store, res, 200, issueJson(store, repo, issue));
+      sendText(store, res, 200, issueText(store, repo, issue));
       return true;
     }
     return notFound(store, res);

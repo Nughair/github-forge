@@ -29,10 +29,27 @@ export function sendJson(
   value: unknown,
   extraHeaders: Readonly<Record<string, string>> = {},
 ): void {
-  const text = JSON.stringify(value) ?? 'null';
+  sendText(store, res, status, JSON.stringify(value) ?? 'null', extraHeaders);
+}
+
+/**
+ * Send a JSON reply whose body the caller already serialized. The hot REST
+ * paths build their bytes with templates (rest.ts) instead of allocating an
+ * object graph for JSON.stringify to walk; the wire bytes are the same.
+ * Content-Length is stated outright: the body is complete in one end() call,
+ * and a stated length is cheaper for keep-alive clients than chunked framing.
+ */
+export function sendText(
+  store: Store,
+  res: ServerResponse,
+  status: number,
+  text: string,
+  extraHeaders: Readonly<Record<string, string>> = {},
+): void {
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'x-github-request-id': store.nextRequestId(),
+    'content-length': Buffer.byteLength(text),
     ...extraHeaders,
   });
   res.end(text);
