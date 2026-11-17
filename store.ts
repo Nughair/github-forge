@@ -97,6 +97,16 @@ export class Store {
   private itemSeq = 0;
   private seq = 0; // one logical clock tick per mutation, shared by every record
   private requestSeq = 0;
+  /**
+   * State version for the GET response memo (cache.ts): bumped once a mutating
+   * request has fully completed, so a body memoized under a version is only
+   * ever served while the store is still in exactly the state that produced
+   * it. `mutationsInFlight` counts mutating requests being handled right now;
+   * new memo entries are only taken while it is 0, so an entry can never
+   * capture a half-applied mutation.
+   */
+  version = 0;
+  mutationsInFlight = 0;
   private readonly baseTimeMs: number;
 
   constructor() {

@@ -8,6 +8,7 @@
 // /{owner}/{repo}.git/* to git smart HTTP. One Store instance backs them all.
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { captureResponse, lookupResponse, responseKey, serveResponse, storeResponse } from './cache.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleInfoRefs, handleReceivePack, handleUploadPack } from './githttp.ts';
 import { handleMcp } from './mcp.ts';
@@ -31,7 +32,39 @@ function decodeSegment(segment: string): string {
   }
 }
 
+/**
+ * The request wrapper every surface runs inside. A non-GET request is a
+ * potential mutation: it is counted in flight while it runs, and the store's
+ * state version is bumped once it completes, which retires every GET answer
+ * memoized under the older state (cache.ts). A GET first asks the memo; on a
+ * miss its answer is captured and memoized, but only when no mutation is in
+ * flight, so a memoized body always reflects one whole, completed state.
+ */
 async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const method = req.method ?? 'GET';
+  if (method !== 'GET') {
+    store.mutationsInFlight += 1;
+    try {
+      await dispatch(req, res);
+    } finally {
+      store.mutationsInFlight -= 1;
+      store.version += 1;
+    }
+    return;
+  }
+  const key = responseKey(store, req.url ?? '/', req.headers.host ?? '', authorized(req));
+  const hit = lookupResponse(key);
+  if (hit !== null) {
+    serveResponse(store, res, hit);
+    return;
+  }
+  const take = captureResponse(res);
+  await dispatch(req, res);
+  const entry = take();
+  if (entry !== null && entry.status < 500 && store.mutationsInFlight === 0) storeResponse(key, entry);
+}
+
+async function dispatch(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://forge');
   const path = url.pathname;
 
