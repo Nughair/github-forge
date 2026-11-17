@@ -10,6 +10,14 @@ import type { Store } from './store.ts';
 
 /** Read a request body whole. Bodies in this suite are small; a generous cap guards the loop. */
 export async function readBody(req: IncomingMessage): Promise<Buffer> {
+  // The raw transport (rawhttp.ts) assembles the whole body before dispatch
+  // and exposes it as rawBody: take it directly — no async-iterator setup and
+  // no copying Buffer.concat on every POST.
+  const preassembled = (req as unknown as { rawBody?: Buffer }).rawBody;
+  if (preassembled !== undefined) {
+    if (preassembled.length > 64 * 1024 * 1024) throw new Error('request body too large');
+    return preassembled;
+  }
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {

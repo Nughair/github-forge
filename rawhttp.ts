@@ -51,6 +51,9 @@ export class RawRequest {
   /** Header values by lowercased name; repeats are joined with ', ' as Node joins them. */
   readonly headers: Record<string, string | string[]>;
   readonly httpVersion: string;
+  // The fully assembled request body, exposed so body readers can take it
+  // directly instead of paying for async iteration plus a copying concat.
+  readonly rawBody: Buffer;
   private readonly body: Buffer;
 
   constructor(method: string, url: string, headers: Record<string, string | string[]>, httpVersion: string, body: Buffer) {
@@ -58,6 +61,7 @@ export class RawRequest {
     this.url = url;
     this.headers = headers;
     this.httpVersion = httpVersion;
+    this.rawBody = body;
     this.body = body;
   }
 
